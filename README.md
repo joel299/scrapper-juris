@@ -28,7 +28,7 @@ A coleta usa apenas HTTPS e domínios oficiais do STJ permitidos pelo servidor. 
 ## Requisitos
 
 - Python 3.11 ou superior.
-- Nenhuma dependência Python de terceiros para executar o servidor ou os testes.
+- Driver PostgreSQL `psycopg` instalado pelas dependências do projeto.
 - Acesso à rede para buscar conjuntos publicados no Portal de Dados Abertos do STJ.
 - Navegador moderno para a interface.
 
@@ -39,45 +39,50 @@ Clone o repositório e inicie o servidor:
 ```bash
 git clone https://github.com/joel299/scrapper-juris.git
 cd scrapper-juris
+python -m pip install -e .
 python -m app.server
 ```
 
 Acesse <http://127.0.0.1:8000>. O servidor escuta somente em loopback por segurança. Não o exponha diretamente à internet: esta versão não oferece autenticação remota nem TLS.
 
-### Configuração
+### Configurar o PostgreSQL com segurança
+
+1. Copie `.env.example` para `.env` (ou use o `.env` local criado no projeto).
+2. Defina `DATABASE_URL` com a URI do PostgreSQL/Supabase. Não envie a URI pelo chat e não a cole no formulário web.
+3. Configure `DATABASE_SCHEMA` (padrão `public`) e mantenha `PGSSLMODE=require`, salvo se seu provedor exigir `verify-full`.
+4. Restrinja as permissões do usuário da conexão ao mínimo necessário. Para a fase de inspeção, acesso de leitura aos metadados basta; não conceda escrita até aprovarmos o mapeamento.
+5. Reinicie o servidor depois de alterar `.env`, abra **Nova captura**, teste a conexão e use **Inspecionar tabelas/colunas**.
+
+`.env` é excluído do Git. Não compartilhe o conteúdo dele nem inclua uma URI real em capturas, issues ou logs. Uma URI contém senha, host e nome do banco; se ela for exposta, revogue a credencial e gere outra.
+
+Variáveis adicionais:
 
 - `PORT`: porta HTTP local (padrão `8000`).
-- `SCRAPER_DATA_DIR`: diretório de persistência local (padrão `./data`).
-- `SCRAPER_HOST`: permanece limitado a `127.0.0.1`, `localhost` ou `::1`; o servidor recusa outros endereços.
+- `SCRAPER_DATA_DIR`: diretório de persistência local do histórico (padrão `./data`).
 
-Exemplo:
-
-```bash
-PORT=8080 SCRAPER_DATA_DIR="$HOME/.local/share/scrapper-juris" python -m app.server
-```
-
-A base é criada automaticamente em `data/scraper.sqlite3`. Ela é ignorada pelo Git e não deve ser commitada.
+A base local de histórico é criada em `data/scraper.sqlite3`. Ela permanece distinta do PostgreSQL de destino.
 
 ## Como usar
 
-1. Clique em **Nova captura** e teste o armazenamento SQLite local.
-2. Cadastre uma página de conjunto oficial, por exemplo: `https://dadosabertos.web.stj.jus.br/dataset/espelhos-de-acordaos-primeira-secao`.
-3. Selecione a fonte e inicie a captura.
-4. Acompanhe o processamento no painel e abra uma execução para consultar itens e proveniência.
+1. Configure `DATABASE_URL` no arquivo `.env` e reinicie o servidor.
+2. Em **Nova captura**, teste a conexão PostgreSQL (a URI nunca aparece no navegador).
+3. Use **Inspecionar tabelas/colunas** e forneça a definição do schema seguindo [`DATABASE_SCHEMA_GUIDE.md`](DATABASE_SCHEMA_GUIDE.md).
+4. A gravação de execuções no PostgreSQL permanece bloqueada até aprovar a tabela de destino, o mapeamento de campos, a chave de idempotência e as permissões mínimas.
 
-O teste de conexão verifica apenas o SQLite local; ele não configura conexão com Supabase ou PostgreSQL.
+O SQLite local guarda fontes e histórico do protótipo; não é o banco PostgreSQL de destino. O teste não grava no banco externo.
 
 ## API local
 
 | Método | Rota | Descrição |
 |---|---|---|
-| `GET` | `/api/health` | Estado do servidor e armazenamento local |
-| `GET` | `/api/sources` | Lista fontes cadastradas |
+| `GET` | `/api/health` | Estado do servidor e indicação de URI PostgreSQL configurada (sem expor a URI) |
+| `GET` | `/api/database/schema` | Lista tabelas e colunas visíveis no schema configurado, sem ler linhas |
+| `GET` | `/api/sources` | Lista fontes cadastradas localmente |
 | `POST` | `/api/sources` | Cadastra `{ "source_url": "https://...", "dataset": "..." }` |
-| `GET` | `/api/runs` | Lista execuções recentes |
-| `POST` | `/api/runs` | Inicia execução com `{ "source_ids": ["..."] }` |
+| `GET` | `/api/runs` | Lista execuções locais recentes |
+| `POST` | `/api/runs` | Inicia execução local com `{ "source_ids": ["..."] }`; fica bloqueada se `DATABASE_URL` está configurada, até confirmar mapeamento de escrita |
 | `GET` | `/api/runs/{id}` | Consulta execução, recursos e itens |
-| `POST` | `/api/connection/test` | Testa acesso ao SQLite local |
+| `POST` | `/api/connection/test` | Testa SQLite e, se configurado, conexão PostgreSQL; não grava dados |
 
 ## Testes e verificações
 
@@ -97,19 +102,22 @@ static/index.html      Interface web responsiva
 tests/                 Testes automatizados
 data/                  Banco SQLite local (não versionado)
 .github/workflows/     Verificação contínua
-pyproject.toml         Metadados e requisitos do projeto
+pyproject.toml         Metadados e dependências do projeto
+.env.example           Modelo de configuração (sem credenciais reais)
+DATABASE_SCHEMA_GUIDE.md Informações de schema necessárias para habilitar escrita
 SECURITY.md            Política de reporte de vulnerabilidades
 ```
 
 ## Limitações conhecidas
 
-Esta versão é executada localmente e usa SQLite. Ainda não se integra a outro sistema, não lê fontes de um banco externo, não oferece autenticação/autorização remota, fila durável, cancelamento de execução ou worker separado. O processamento em segundo plano ocorre em threads do próprio processo; reiniciar o servidor interrompe tarefas em andamento.
+A aplicação pode testar uma conexão PostgreSQL e inspecionar nomes e tipos de tabelas/colunas visíveis à role. A gravação de acórdãos no PostgreSQL ainda está desabilitada até o schema real ser revisado e o destino/mapeamento/idempotência serem confirmados. Fontes e histórico local ainda usam SQLite. O protótipo não oferece autenticação/autorização remota, fila durável, cancelamento ou worker separado; tarefas em segundo plano usam threads do processo e são interrompidas quando o servidor encerra.
 
-A descoberta inicial busca links `.json` e `.zip` em páginas oficiais. Estruturas JSON não reconhecidas são rejeitadas ou mantidas como payload original; nenhum outro tribunal ou produto jurídico é declarado como suportado. A captura de conjuntos grandes deve ser avaliada antes de iniciada.
+A descoberta busca links `.json` e `.zip` em páginas oficiais. Estruturas JSON não reconhecidas são rejeitadas ou mantidas como payload original. Nenhum outro tribunal é declarado como suportado. A captura de conjuntos grandes requer validação do formato e dos limites antes da execução.
 
 ## Segurança
 
-- Nunca envie credenciais reais a esta aplicação local nem a inclua em issues, logs ou commits.
+- Nunca envie a URI, senha ou tokens pelo chat, navegador, issue, log ou commit; mantenha-os no `.env` local, ignorado pelo Git.
 - Não exponha o servidor fora de loopback sem implementar autenticação, autorização e TLS.
+- Use role PostgreSQL de privilégio mínimo; até revisar o schema, conexão somente para teste/inspeção.
 - O acesso às fontes externas é restrito por allowlist de host, esquema e porta, inclusive em redirecionamentos.
 - Consulte `SECURITY.md` para reportar vulnerabilidades.

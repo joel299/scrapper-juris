@@ -18,6 +18,31 @@ from urllib.parse import urljoin, urlparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 ROOT = Path(__file__).resolve().parent.parent
+
+
+def load_local_env() -> None:
+    """Load simple KEY=VALUE entries from the project .env without logging secrets."""
+    env_path = ROOT / ".env"
+    if not env_path.is_file():
+        return
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key, value = key.strip(), value.strip()
+        if not re.fullmatch(r"[A-Z_][A-Z0-9_]*", key):
+            continue
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '\"'):
+            value = value[1:-1]
+        os.environ.setdefault(key, value)
+
+
+load_local_env()
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+DATABASE_SCHEMA = os.environ.get("DATABASE_SCHEMA", "public").strip() or "public"
+PGSSLMODE = os.environ.get("PGSSLMODE", "require").strip() or "require"
+
 DATA_DIR = Path(os.environ.get("SCRAPER_DATA_DIR", ROOT / "data")).resolve()
 DB_PATH = DATA_DIR / "scraper.sqlite3"
 STATIC_DIR = ROOT / "static"
@@ -40,6 +65,64 @@ def connect() -> sqlite3.Connection:
     con.execute("PRAGMA foreign_keys=ON")
     con.execute("PRAGMA journal_mode=WAL")
     return con
+
+
+def postgres_connection():
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL não está definida no arquivo .env.")
+    try:
+        import psycopg
+        from psycopg.rows import dict_row
+    except ImportError:
+        raise RuntimeError("Driver PostgreSQL ausente. Instale as dependências com: pip install -e .") from None
+    try:
+        return psycopg.connect(
+            DATABASE_URL,
+            connect_timeout=8,
+            sslmode=PGSSLMODE,
+            application_name="scrapper-juris-local",
+            row_factory=dict_row,
+        )
+    except Exception as exc:
+        # Driver exceptions can include the full connection URI; never return them.
+        code = getattr(exc, "sqlstate", None)
+        if code and str(code).startswith("28"):
+            message = "Autenticação PostgreSQL recusada; confira usuário, senha e permissões."
+        elif code and str(code).startswith("08"):
+            message = "Não foi possível alcançar o servidor PostgreSQL; confira host, porta e SSL."
+        else:
+            message = "Falha ao conectar ao PostgreSQL. Confira a URI, a rede e a configuração SSL; detalhes foram omitidos para proteger credenciais."
+        raise RuntimeError(message) from None
+
+
+def postgres_health():
+    with postgres_connection() as db:
+        row = db.execute("SELECT current_database() AS database, current_schema() AS current_schema").fetchone()
+        return {"database": row["database"], "current_schema": row["current_schema"]}
+
+
+def postgres_schema(schema: str):
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,62}", schema):
+        raise ValueError("Nome de schema inválido.")
+    with postgres_connection() as db:
+        rows = db.execute("""
+            SELECT c.table_name, c.column_name, c.data_type, c.udt_name,
+                   c.is_nullable, c.is_identity, c.ordinal_position
+            FROM information_schema.columns AS c
+            JOIN information_schema.tables AS t
+              ON t.table_catalog=c.table_catalog AND t.table_schema=c.table_schema
+             AND t.table_name=c.table_name
+            WHERE c.table_schema=%s AND t.table_type='BASE TABLE'
+            ORDER BY c.table_name, c.ordinal_position
+        """, (schema,)).fetchall()
+    tables: dict[str, list[dict]] = {}
+    for row in rows:
+        tables.setdefault(row["table_name"], []).append({
+            "name": row["column_name"], "type": row["data_type"],
+            "database_type": row["udt_name"], "nullable": row["is_nullable"] == "YES",
+            "identity": row["is_identity"] == "YES",
+        })
+    return {"schema": schema, "tables": [{"name": name, "columns": columns} for name, columns in tables.items()]}
 
 
 def init_db() -> None:
@@ -283,7 +366,114 @@ def add_resource_error(run_id: str, source: dict, message: str, resource_id: str
         db.execute("UPDATE runs SET error_count=error_count+1,safe_error_summary=COALESCE(safe_error_summary,?) WHERE id=?", (safe, run_id))
 
 
+def postgres_source_id(source: dict) -> str:
+    """Resolve a registered PostgreSQL source by its exact official dataset URL."""
+    from psycopg import sql
+    table = sql.Identifier(DATABASE_SCHEMA, "jurisprudence_sources")
+    with postgres_connection() as db:
+        row = db.execute(
+            sql.SQL("SELECT id FROM {} WHERE dataset_url=%s").format(table),
+            (source["source_url"],),
+        ).fetchone()
+        if not row:
+            raise RuntimeError("A fonte do conjunto não está cadastrada em jurisprudence_sources.")
+        return row["id"]
+
+
+def map_postgres_document(source: dict, source_url: str, record: dict, captured: str):
+    """Map the known STJ Espelhos JSON fields into the confirmed PostgreSQL contract."""
+    raw = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
+    digest = hashlib.sha256(raw.encode()).hexdigest()
+    def first(*keys):
+        return pick(record, keys) or ""
+    return (
+        record_id(record), source["tribunal"], first("numeroProcesso"),
+        first("siglaClasse", "descricaoClasse"), first("nomeOrgaoJulgador"),
+        first("ministroRelator"), parse_stj_date(record.get("dataDecisao")),
+        parse_stj_date(record.get("dataPublicacao")), first("ementa"),
+        first("teseJuridica"), first("decisao"), source["source_url"],
+        captured, digest, raw,
+    )
+
+
+def parse_stj_date(value):
+    if not value:
+        return None
+    text = str(value).strip()
+    for fmt in ("%Y%m%d", "%Y-%m-%d", "%d/%m/%Y"):
+        try:
+            return datetime.strptime(text, fmt).date()
+        except ValueError:
+            pass
+    match = re.search(r"DATA:\s*(\d{2}/\d{2}/\d{4})", text)
+    if match:
+        try:
+            return datetime.strptime(match.group(1), "%d/%m/%Y").date()
+        except ValueError:
+            pass
+    return None
+
+
+def persist_postgres_records(source: dict, source_url: str, records: list[dict]):
+    """Upsert one downloaded resource transactionally using the confirmed unique key."""
+    from psycopg import sql
+    source_id = postgres_source_id(source)
+    mapped = [map_postgres_document(source, source_url, record, now()) for record in records]
+    inserted = updated = duplicate = 0
+    table = sql.Identifier(DATABASE_SCHEMA, "jurisprudence_documents")
+    with postgres_connection() as db:
+        for values in mapped:
+            row = db.execute(
+                sql.SQL("SELECT content_sha256 FROM {} WHERE source_id=%s AND external_id=%s").format(table),
+                (source_id, values[0])
+            ).fetchone()
+            if row and row["content_sha256"] == values[13]:
+                duplicate += 1
+                continue
+            db.execute(
+                sql.SQL('''INSERT INTO {}
+                    (source_id,external_id,court,process_number,class_name,panel,rapporteur,
+                     decision_date,publication_date,summary,thesis,full_text,source_url,
+                     captured_at,content_sha256,metadata_json)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
+                    ON CONFLICT (source_id,external_id) DO UPDATE SET
+                     court=EXCLUDED.court,process_number=EXCLUDED.process_number,
+                     class_name=EXCLUDED.class_name,panel=EXCLUDED.panel,rapporteur=EXCLUDED.rapporteur,
+                     decision_date=EXCLUDED.decision_date,publication_date=EXCLUDED.publication_date,
+                     summary=EXCLUDED.summary,thesis=EXCLUDED.thesis,full_text=EXCLUDED.full_text,
+                     source_url=EXCLUDED.source_url,captured_at=EXCLUDED.captured_at,
+                     content_sha256=EXCLUDED.content_sha256,metadata_json=EXCLUDED.metadata_json''').format(table),
+                (source_id, *values),
+            )
+            if row:
+                updated += 1
+            else:
+                inserted += 1
+    return inserted, updated, duplicate
+
+
 def process_records(run_id: str, resource_id: str, source: dict, resource_url: str, records: list[dict]) -> None:
+    if DATABASE_URL:
+        try:
+            inserted, updated, duplicate = persist_postgres_records(source, resource_url, records)
+            with connect() as db:
+                for record in records:
+                    rid = record_id(record)
+                    raw = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
+                    digest = hashlib.sha256(raw.encode()).hexdigest()
+                    db.execute("INSERT INTO run_items(id,run_id,resource_id,source_record_id,status,content_hash,processed_at) VALUES(?,?,?,?,?,?,?)",
+                               (str(uuid.uuid4()), run_id, resource_id, rid, "postgres_persisted", digest, now()))
+                db.execute("UPDATE runs SET inserted_count=inserted_count+?,updated_count=updated_count+?,duplicate_count=duplicate_count+? WHERE id=?",
+                           (inserted, updated, duplicate, run_id))
+            return
+        except Exception:
+            with connect() as db:
+                db.execute("UPDATE runs SET error_count=error_count+?,safe_error_summary=COALESCE(safe_error_summary,?) WHERE id=?",
+                           (len(records), "Falha segura ao persistir registros no PostgreSQL.", run_id))
+                for record in records:
+                    db.execute("INSERT INTO run_items(id,run_id,resource_id,source_record_id,status,safe_error_summary,processed_at) VALUES(?,?,?,?,'failed','Falha ao persistir registro no PostgreSQL.',?)",
+                               (str(uuid.uuid4()), run_id, resource_id, record_id(record), now()))
+            return
     for record in records:
         rid = record_id(record)
         raw = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
@@ -341,7 +531,23 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path=urlparse(self.path).path
         if path=="/api/health":
-            self.send_json({"ok":True,"storage":"sqlite-local","database":str(DB_PATH)}); return
+            self.send_json({"ok":True,"local_storage":"sqlite","postgres_configured":bool(DATABASE_URL)}); return
+        if path=="/api/database/schema":
+            schema=urlparse(self.path).query
+            query={}
+            for pair in schema.split("&"):
+                if "=" in pair:
+                    key,value=pair.split("=",1)
+                    if key=="schema": query["schema"]=value
+            if not DATABASE_URL:
+                self.send_json({"error":"Configure DATABASE_URL no arquivo .env e reinicie o servidor."},503); return
+            try:
+                self.send_json(postgres_schema(query.get("schema",DATABASE_SCHEMA)))
+            except ValueError as exc:
+                self.send_json({"error":str(exc)},400)
+            except RuntimeError as exc:
+                self.send_json({"error":str(exc)},503)
+            return
         if path=="/api/sources":
             with connect() as db: rows=db.execute("SELECT * FROM sources ORDER BY created_at DESC").fetchall()
             self.send_json([dict(r) for r in rows]); return
@@ -370,9 +576,14 @@ class Handler(BaseHTTPRequestHandler):
         try:
             body=self.read_body()
             if path=="/api/connection/test":
-                # This standalone MVP explicitly tests only its local SQLite storage.
                 with connect() as db: db.execute("SELECT 1").fetchone()
-                self.send_json({"ok":True,"message":"Banco local SQLite acessível.","database":"scraper.sqlite3"}); return
+                if DATABASE_URL:
+                    try:
+                        info=postgres_health()
+                    except RuntimeError as exc:
+                        self.send_json({"ok":False,"local_ok":True,"postgres_ok":False,"message":str(exc)},503); return
+                    self.send_json({"ok":True,"local_ok":True,"postgres_ok":True,"database":info["database"],"schema":info["current_schema"],"message":"SQLite local e PostgreSQL configurado acessíveis."}); return
+                self.send_json({"ok":True,"local_ok":True,"postgres_ok":False,"message":"SQLite local acessível; PostgreSQL ainda não configurado."}); return
             if path=="/api/sources":
                 url=safe_public_url(str(body.get("source_url","")))
                 parsed=urlparse(url)

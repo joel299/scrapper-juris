@@ -8,6 +8,7 @@ version = "0.1.0"
 description = "Importador local de dados públicos de jurisprudência do STJ"
 readme = "README.md"
 requires-python = ">=3.11"
+dependencies = ["psycopg[binary]>=3.2,<4"]
 
 [tool.setuptools]
 packages = ["app"]
